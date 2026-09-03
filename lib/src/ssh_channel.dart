@@ -82,12 +82,15 @@ class SSHChannelController {
   /// back. Counts bytes accepted into [_remoteStream], not bytes the consumer
   /// has read.
   ///
-  /// Half the window is the same idea as OpenSSH, which refills once
-  /// `local_window < local_window_max / 2` in `channels.c`. It is not the
-  /// same test: this grants at exactly `localInitialWindowSize ~/ 2` where
-  /// OpenSSH grants a byte later, and OpenSSH also refills on
-  /// `local_consumed > local_maxpacket * 3`. Erring earlier is the safe
-  /// direction — it can only send a grant sooner than needed.
+  /// Half the window is one of the two rules OpenSSH applies in `channels.c`,
+  /// which refills when `local_window < local_window_max / 2` or when
+  /// `local_window_max - local_window > local_maxpacket * 3`, whichever comes
+  /// first. Only the first is implemented here, and at this library's sizes
+  /// the other is the one that would fire sooner: at a 2 MiB window with
+  /// 32 KiB packets OpenSSH refills every three or four packets where this
+  /// waits for thirty-two. So this defers further than OpenSSH does, not
+  /// less far, which is deliberate because sending fewer grants is the point.
+  /// What bounds the deferral is the floor below, not the comparison.
   ///
   /// Never defers past `W - P + 1`, so the peer is always left at least one
   /// maximum-size packet of credit. Below that, a sender holding a chunk
