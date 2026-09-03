@@ -60,9 +60,50 @@ class SSHChannelController {
   late var _remoteWindow = remoteInitialWindowSize;
 
   /// A [StreamController] that receives data from the remote side.
+  ///
+  /// Both hooks bypass [_windowAdjustThreshold], and `onListen` has to.
+  /// A controller with no listener reports `isPaused`, so every grant is
+  /// suppressed until the application subscribes — and Dart delivers that
+  /// first subscription as `onListen`, never as `onResume`. Without this a
+  /// peer that filled the window before the application got there is left at
+  /// zero credit with no further data able to arrive and trigger a grant. The
+  /// remote forwarding example in the README reaches it: it awaits
+  /// `Socket.connect()` before subscribing to the channel.
+  ///
+  /// `onResume` does not need the bypass for liveness — a consumer that
+  /// paused below the threshold still leaves the peer credit to send into —
+  /// but keeps the pre-threshold behaviour of granting whatever was admitted.
   late final _remoteStream = StreamController<SSHChannelData>(
-    onResume: _sendWindowAdjustIfNeeded,
+    onListen: () => _sendWindowAdjustIfNeeded(force: true),
+    onResume: () => _sendWindowAdjustIfNeeded(force: true),
   );
+
+  /// How many admitted bytes must accumulate before the peer is granted them
+  /// back. Counts bytes accepted into [_remoteStream], not bytes the consumer
+  /// has read.
+  ///
+  /// Half the window is one of the two rules OpenSSH applies in `channels.c`,
+  /// which refills when `local_window < local_window_max / 2` or when
+  /// `local_window_max - local_window > local_maxpacket * 3`, whichever comes
+  /// first. Only the first is implemented here, and at this library's sizes
+  /// the other is the one that would fire sooner: at a 2 MiB window with
+  /// 32 KiB packets OpenSSH refills every three or four packets where this
+  /// waits for thirty-two. So this defers further than OpenSSH does, not
+  /// less far, which is deliberate because sending fewer grants is the point.
+  /// What bounds the deferral is the floor below, not the comparison.
+  ///
+  /// Never defers past `W - P + 1`, so the peer is always left at least one
+  /// maximum-size packet of credit. Below that, a sender holding a chunk
+  /// larger than the credit it has left can wait for a grant while this side
+  /// waits for data: it may not overrun the window, and nothing obliges it to
+  /// split the chunk. Only reachable when the window is under twice the
+  /// packet size; the client's own 2 MiB / 32 KiB pair is nowhere near it.
+  int get _windowAdjustThreshold {
+    final half = localInitialWindowSize ~/ 2;
+    final keepOnePacket = localInitialWindowSize - localMaximumPacketSize + 1;
+    final threshold = half < keepOnePacket ? half : keepOnePacket;
+    return threshold < 1 ? 1 : threshold;
+  }
 
   /// A [StreamController] that accepts data from local end of the channel.
   final _localStream = StreamController<SSHChannelData>();
@@ -425,7 +466,15 @@ class SSHChannelController {
     sendMessage(SSH_Message_Channel_Failure(recipientChannel: remoteId));
   }
 
-  void _sendWindowAdjustIfNeeded() {
+  /// Grants admitted receive window back to the peer.
+  ///
+  /// Deferred until [_windowAdjustThreshold] bytes have accumulated, so a
+  /// transfer or a chatty interactive channel stops answering every inbound
+  /// packet with an uplink packet of its own.
+  ///
+  /// [force] bypasses the threshold for the [_remoteStream] hooks; see there
+  /// for why the first listener in particular cannot wait for it.
+  void _sendWindowAdjustIfNeeded({bool force = false}) {
     printDebug?.call('SSHChannel._sendWindowAdjustIfNeeded');
 
     if (_done.isCompleted) return;
@@ -433,6 +482,7 @@ class SSHChannelController {
 
     final bytesToAdd = localInitialWindowSize - _localWindow;
     if (bytesToAdd <= 0) return;
+    if (!force && bytesToAdd < _windowAdjustThreshold) return;
 
     _localWindow = localInitialWindowSize;
 
